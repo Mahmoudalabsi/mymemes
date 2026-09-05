@@ -130,7 +130,7 @@ export async function handler(event) {
           ? `inline; filename*=UTF-8''${encodedFilename}`
           : `attachment; filename*=UTF-8''${encodedFilename}`,
         "Content-Length": audioBuffer.length.toString(),
-        "Cache-Control": "public, max-age=86400",
+        "Cache-Control": "public, max-age=2592000, immutable",
         ...corsHeaders,
       },
       body: audioBuffer.toString("base64"),

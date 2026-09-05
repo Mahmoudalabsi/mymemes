@@ -199,14 +199,21 @@ async function init() {
   wireControls();
   initTheme();
 
-  // Load data
+  // Load data — CHUNKED for fast first paint:
+  //   categories.json + sounds-index.json + chunk 0 arrive together and render
+  //   immediately (~85KB gzipped instead of the old 620KB monolith);
+  //   the remaining chunks stream in the background and merge silently.
   try {
-    const [catsRes, soundsRes] = await Promise.all([
+    const [catsRes, idxRes, firstRes] = await Promise.all([
       fetch('/data/categories.json'),
-      fetch('/data/sounds.json'),
+      fetch('/data/sounds-index.json'),
+      fetch('/data/sounds-chunk-0.json'),
     ]);
     state.categories = await catsRes.json();
-    state.sounds = await soundsRes.json();
+    const index = await idxRes.json();
+    state.totalSounds = (index && index.total) || 0;
+    state.chunkCount = (index && index.chunks && index.chunks.length) || 1;
+    state.sounds = await firstRes.json();
   } catch (e) {
     console.error('Failed to load data:', e);
   }
@@ -230,6 +237,89 @@ async function init() {
 
   // Observe infinite scroll trigger
   setupInfiniteScroll();
+
+  // Stream the remaining data chunks in the background (non-blocking)
+  loadRemainingChunks();
+
+  // Warm audio cache on hover (desktop) — click-to-play becomes instant
+  const grid = document.getElementById('sounds-grid');
+  if (grid) {
+    grid.addEventListener('mouseover', (e) => {
+      const card = e.target.closest('.sound-card');
+      if (!card) return;
+      const sound = state.sounds.find(s => s.slug === card.dataset.slug);
+      if (sound) prefetchAudio(sound);
+    });
+  }
+}
+
+// ---------- BACKGROUND CHUNK LOADER ----------
+// Fetches sounds-chunk-1..N sequentially and merges them into the live lists
+// without resetting the rendered grid or scroll position.
+async function loadRemainingChunks() {
+  for (let i = 1; i < (state.chunkCount || 1); i++) {
+    try {
+      const res = await fetch(`/data/sounds-chunk-${i}.json`);
+      if (res.ok) mergeChunk(await res.json());
+    } catch (e) {
+      console.warn(`Chunk ${i} failed to load:`, e && e.message);
+    }
+  }
+  onAllChunksLoaded();
+}
+
+function mergeChunk(chunk) {
+  if (!Array.isArray(chunk) || chunk.length === 0) return;
+  state.sounds = state.sounds.concat(chunk);
+
+  const idle = !state.search && !state.selectedCategory && state.sort === 'newest';
+  if (idle) {
+    // Extend the pool silently — infinite scroll picks new items up naturally
+    // on the next scroll, and the current DOM stays untouched.
+    state.filtered = state.filtered.concat(chunk);
+    state.hasMore = state.filtered.length > state.page * state.pageSize;
+    if (state.hasMore) {
+      const allLoaded = document.getElementById('all-loaded');
+      if (allLoaded) allLoaded.hidden = true;
+    }
+    updateResultsInfo();
+  }
+}
+
+function onAllChunksLoaded() {
+  state.totalPlays = state.sounds.reduce((sum, s) => sum + (s.plays || 0), 0);
+  renderStats();
+  renderCategories();
+
+  // If the user is actively filtering/searching/sorting, refilter from the
+  // COMPLETE dataset while keeping the current page count (no scroll reset).
+  if (state.search || state.selectedCategory || state.sort !== 'newest') {
+    refilterKeepPage();
+  }
+}
+
+function refilterKeepPage() {
+  let list = state.sounds.slice();
+  if (state.selectedCategory) {
+    list = list.filter(s => s.cat === state.selectedCategory);
+  }
+  if (state.search) {
+    const q = state.search;
+    list = list.filter(s =>
+      (s.name || '').toLowerCase().includes(q) ||
+      (s.slug || '').toLowerCase().includes(q) ||
+      (s.tags || '').toLowerCase().includes(q)
+    );
+  }
+  if (state.sort === 'popular') {
+    list.sort((a, b) => (b.plays || 0) - (a.plays || 0));
+  } else if (state.sort === 'name') {
+    list.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+  }
+  state.filtered = list;
+  state.hasMore = list.length > state.pageSize;
+  renderSounds(false);
+  updateResultsInfo();
 }
 
 // ---------- I18N ----------
@@ -554,6 +644,9 @@ function renderSounds(reset) {
   // Update play state on cards
   updatePlayingCard();
 
+  // Warm the audio cache for the first few cards just rendered
+  prefetchBatch(slice, 6);
+
   // Show/hide loading + all-loaded
   if (state.loadingMore) {
     loadingMore.hidden = false;
@@ -764,41 +857,122 @@ function proxyAudioUrl(sound) {
   return `${downloadEndpoint()}?url=${encodeURIComponent(sound.url)}&name=${encodeURIComponent(sound.name || '')}&inline=1`;
 }
 
-function tryPlay(src) {
-  audioEl.src = src;
-  return audioEl.play(); // resolves when playback actually starts
+// Prefetch bookkeeping (browser HTTP cache + Cloudflare edge cache warm-up)
+const prefetched = new Set();
+let playToken = 0; // guards against rapid click races
+
+function stopAudio(el) {
+  if (!el) return;
+  try {
+    el.pause();
+    el.removeAttribute('src');
+    el.load();
+  } catch (e) { /* noop */ }
+}
+
+// Silently download an audio file ahead of time through our proxy:
+//  - the browser caches it (proxy sends Cache-Control: immutable)
+//  - Cloudflare's edge cache gets warmed for every future visitor
+function prefetchAudio(sound) {
+  if (!sound || !sound.slug || prefetched.has(sound.slug)) return;
+  if (prefetched.size >= 80) return; // cap per session
+  const conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+  if (conn && (conn.saveData || /(^|\b)2g\b/i.test(conn.effectiveType || ''))) return;
+  prefetched.add(sound.slug);
+  try {
+    const el = new Audio();
+    el.preload = 'auto';
+    el.src = proxyAudioUrl(sound);
+    el.load();
+    // Free the decoder/buffer after a minute; the HTTP cache entry remains.
+    setTimeout(() => stopAudio(el), 60000);
+  } catch (e) { /* noop */ }
+}
+
+function prefetchBatch(list, n = 6) {
+  if (!Array.isArray(list)) return;
+  let count = 0;
+  for (const s of list) {
+    if (count >= n) break;
+    if (!prefetched.has(s.slug)) {
+      prefetchAudio(s);
+      count++;
+    }
+  }
 }
 
 async function handlePlay(sound) {
-  if (!audioEl) audioEl = new Audio();
-  if (currentSlug === sound.slug && isPlaying) {
-    audioEl.pause();
+  const token = ++playToken;
+
+  // Toggle off if the same sound is already playing
+  if (currentSlug === sound.slug && isPlaying && audioEl) {
+    stopAudio(audioEl);
+    audioEl = null;
+    isPlaying = false;
+    currentSlug = null;
+    updatePlayingCard();
+    return;
+  }
+
+  // RACE both sources in parallel — direct (fast when it works) vs our proxy
+  // (reliable, edge-cached). Whichever STARTS playing first wins; the other is
+  // discarded instantly. This removes the old sequential-failure delay where
+  // a blocked/slow direct link stalled playback for seconds.
+  const a1 = new Audio();
+  a1.preload = 'auto';
+  a1.src = sound.url;
+  const a2 = new Audio();
+  a2.preload = 'auto';
+  a2.src = proxyAudioUrl(sound);
+
+  let winner = null;
+  try {
+    const attempts = [
+      a1.play().then(() => a1),
+      a2.play().then(() => a2),
+    ];
+    if (typeof Promise.any === 'function') {
+      winner = await Promise.any(attempts);
+    } else {
+      // Legacy fallback: sequential
+      try {
+        winner = await attempts[0];
+      } catch (e1) {
+        if (e1 && e1.name === 'AbortError') throw e1;
+        winner = await attempts[1];
+      }
+    }
+  } catch (err) {
+    if (err && err.name === 'AbortError') return; // user interrupted
+    console.error('All audio sources failed for', sound.slug);
+    stopAudio(a1);
+    stopAudio(a2);
+    if (audioEl && audioEl !== a1 && audioEl !== a2) stopAudio(audioEl);
+    audioEl = null;
     isPlaying = false;
     updatePlayingCard();
     return;
   }
-  audioEl.onended = null;
 
-  const sources = [sound.url, proxyAudioUrl(sound)];
-  for (let i = 0; i < sources.length; i++) {
-    try {
-      await tryPlay(sources[i]);
-      currentSlug = sound.slug;
-      isPlaying = true;
-      updatePlayingCard();
-      registerPlay(sound); // counted only when playback really starts
-      audioEl.onended = () => {
-        isPlaying = false;
-        currentSlug = null;
-        updatePlayingCard();
-      };
-      return;
-    } catch (err) {
-      if (err && err.name === 'AbortError') return; // user interrupted
-      console.warn(`Audio source ${i} failed for "${sound.slug}":`, err && err.message);
-    }
+  // A newer click superseded this one — drop the stale winner quietly.
+  if (token !== playToken) {
+    stopAudio(winner);
+    return;
   }
-  console.error('All audio sources failed for', sound.slug);
+
+  stopAudio(winner === a1 ? a2 : a1); // discard the loser
+  audioEl = winner;
+  currentSlug = sound.slug;
+  isPlaying = true;
+  updatePlayingCard();
+  registerPlay(sound); // counted only when playback really starts
+  audioEl.onended = () => {
+    if (playToken !== token) return;
+    isPlaying = false;
+    currentSlug = null;
+    audioEl = null;
+    updatePlayingCard();
+  };
 }
 
 // ---------- DOWNLOAD ----------

@@ -82,7 +82,9 @@ export async function onRequest(context) {
       "Content-Disposition": inline
         ? `inline; filename*=UTF-8''${encodedFilename}`
         : `attachment; filename*=UTF-8''${encodedFilename}`,
-      "Cache-Control": "public, max-age=86400",
+      // Immutable audio: browser keeps it 30 days, so prefetched/cached files
+      // play back INSTANTLY on repeat visits without touching the network.
+      "Cache-Control": "public, max-age=2592000, immutable",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Expose-Headers": "Content-Disposition",
     };
