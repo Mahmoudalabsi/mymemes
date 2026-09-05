@@ -966,3 +966,28 @@ html[dir="rtl"] .line-dec { --dir-end: left; }
   scrollbar-width: thin;
   scrollbar-color: var(--border-strong) transparent;
 }
+
+/* ============================================
+   SWITCH-SITE BUTTON (header)
+   ============================================ */
+.switch-site-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+  padding: 0.45rem 0.85rem;
+  border-radius: 0.7rem;
+  font-size: 0.78rem;
+  font-weight: 700;
+  background: linear-gradient(135deg, var(--brand), var(--brand-dark));
+  color: var(--on-brand);
+  border: 1px solid transparent;
+  transition: all 0.2s;
+  box-shadow: 0 2px 8px var(--brand-glow);
+  white-space: nowrap;
+}
+.switch-site-btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px var(--brand-glow);
+  color: var(--on-brand);
+}
+html[dir="rtl"] .switch-site-btn svg { transform: scaleX(-1); }
