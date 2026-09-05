@@ -169,6 +169,9 @@ let state = {
   downloadingSlug: null,
   // Per-device play increments (persisted in localStorage)
   playsLocal: {},
+  // Detected backend platform: { plays: <endpoint>, download: <endpoint> }
+  // Resolved at runtime — works on BOTH Netlify and Cloudflare Pages
+  platform: null,
 };
 
 let audioEl = null;
@@ -211,7 +214,7 @@ async function init() {
   // Total plays across all sounds
   state.totalPlays = state.sounds.reduce((sum, s) => sum + (s.plays || 0), 0);
 
-  // Sync with the global server-side counter (Netlify Blobs) — non-blocking
+  // Sync with the global server-side counter (Netlify Blobs / Cloudflare KV) — non-blocking
   syncGlobalPlays();
 
   // Render categories + stats
@@ -644,6 +647,27 @@ function updatePlayingCard() {
 }
 
 // ---------- PLAYS COUNTER ----------
+// Backend detection — supports BOTH platforms:
+//   Cloudflare Pages: /api/plays (KV)        + /download  (functions/*.js)
+//   Netlify:          /.netlify/functions/*  (Blobs)
+async function detectPlatform() {
+  const candidates = [
+    { name: 'cloudflare', plays: '/api/plays', download: '/download' },
+    { name: 'netlify', plays: '/.netlify/functions/plays', download: '/.netlify/functions/download' },
+  ];
+  for (const c of candidates) {
+    try {
+      const res = await fetch(c.plays, { cache: 'no-store' });
+      if (res.ok) return c;
+    } catch (e) { /* try next */ }
+  }
+  return candidates[candidates.length - 1]; // assume Netlify-shaped as fallback
+}
+
+function downloadEndpoint() {
+  return (state.platform && state.platform.download) || '/.netlify/functions/download';
+}
+
 // Effective plays = max(original data, global server count, local device count)
 function effectivePlays(sound) {
   const globalCount = (state.globalPlays && state.globalPlays[sound.slug]) || 0;
@@ -665,7 +689,8 @@ function loadLocalPlays() {
 
 async function syncGlobalPlays() {
   try {
-    const res = await fetch('/.netlify/functions/plays', { cache: 'no-store' });
+    if (!state.platform) state.platform = await detectPlatform();
+    const res = await fetch(state.platform.plays, { cache: 'no-store' });
     if (!res.ok) return;
     const data = await res.json();
     if (!data || !data.counts) return;
@@ -693,12 +718,15 @@ function registerPlay(sound) {
   state.playsLocal[sound.slug] = (state.playsLocal[sound.slug] || 0) + 1;
   try { localStorage.setItem('mymemes_plays_local', JSON.stringify(state.playsLocal)); } catch (e) {}
 
-  // 3) persist globally (fire-and-forget)
-  fetch('/.netlify/functions/plays', {
+  // 3) persist globally (fire-and-forget) — on the detected platform
+  const postIt = state.platform
+    ? Promise.resolve(state.platform)
+    : detectPlatform().then(p => (state.platform = p));
+  postIt.then(p => fetch(p.plays, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ slug: sound.slug }),
-  }).catch(() => {});
+  }).catch(() => {})).catch(() => {});
 
   // 4) update UI live
   updateCardPlays(sound.slug);
@@ -727,10 +755,10 @@ function refreshVisiblePlayCounts() {
 // Audio streaming strategy:
 //   1) Try the direct myinstants URL (fast — works for most visitors)
 //   2) If it fails (hotlink/Cloudflare blocks, dead file...), fall back to our
-//      Netlify proxy (inline mode) which always works
+//      server proxy (inline mode) which always works — Netlify or Cloudflare
 // The play is counted ONLY when playback actually starts.
 function proxyAudioUrl(sound) {
-  return `/.netlify/functions/download?url=${encodeURIComponent(sound.url)}&name=${encodeURIComponent(sound.name || '')}&inline=1`;
+  return `${downloadEndpoint()}?url=${encodeURIComponent(sound.url)}&name=${encodeURIComponent(sound.name || '')}&inline=1`;
 }
 
 function tryPlay(src) {
@@ -798,8 +826,8 @@ async function handleDownload(sound) {
   };
 
   try {
-    // 1) Netlify Python function — best UX, proper Content-Disposition: attachment
-    const fnUrl = `/.netlify/functions/download?url=${encodeURIComponent(sound.url)}&name=${encodeURIComponent(sound.name)}`;
+    // 1) Server function — best UX, proper Content-Disposition: attachment
+    const fnUrl = `${downloadEndpoint()}?url=${encodeURIComponent(sound.url)}&name=${encodeURIComponent(sound.name)}`;
     let res = await fetch(fnUrl).catch(() => null);
     if (res && res.ok) {
       const blob = await res.blob();

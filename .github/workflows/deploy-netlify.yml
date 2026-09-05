@@ -28,7 +28,7 @@ jobs:
         run: >
           npx --yes netlify-cli@latest deploy
           --prod
-          --dir .
+          --dir public
           --functions netlify/functions
           --auth "$NETLIFY_AUTH_TOKEN"
           --site "$NETLIFY_SITE_ID"

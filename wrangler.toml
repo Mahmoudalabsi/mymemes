@@ -1,0 +1,13 @@
+# Cloudflare Pages configuration — MyMemes
+# Static assets: public/  |  Pages Functions: functions/ (standard layout)
+name = "mymemes"
+compatibility_date = "2025-08-01"
+pages_build_output_dir = "public"
+
+# KV namespace for the global plays counter (functions/api/plays.js).
+# At deploy time run:
+#   npx wrangler kv namespace create PLAYS_KV
+# then paste the returned id below (keep the binding name exactly PLAYS_KV).
+[[kv_namespaces]]
+binding = "PLAYS_KV"
+id = "0e7cac8fe1394159a70d871a624dbacd"
